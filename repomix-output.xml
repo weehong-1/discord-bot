@@ -1,0 +1,2028 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  purposes/
+    formatter/
+      __init__.py
+      commands.py
+      formatters.py
+    leetcode/
+      __init__.py
+      commands.py
+      leetcode_client.py
+      models.py
+      tutor.py
+    remind/
+      __init__.py
+      commands.py
+      scheduler.py
+      store.py
+    timer/
+      __init__.py
+      commands.py
+    __init__.py
+  services/
+    __init__.py
+    ai_client.py
+    context.py
+    discord_text.py
+    models.py
+  __init__.py
+  config.py
+  main.py
+.env.example
+.gitignore
+README.md
+requirements.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/purposes/remind/__init__.py">
+
+</file>
+
+<file path="src/purposes/remind/commands.py">
+from __future__ import annotations
+
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord import app_commands
+
+from ...config import Settings
+from ..leetcode.leetcode_client import LeetCodeClient, LeetCodeError
+from .scheduler import ReminderScheduler
+from .store import Reminder
+
+
+LOGGER = logging.getLogger(__name__)
+
+MAX_MINUTES = 7 * 24 * 60
+MAX_HOURS = 7 * 24
+MAX_DAYS = 365
+
+# Spaced-repetition presets: choice value is a comma-separated list of day offsets.
+SPACED_PRESETS: dict[str, list[int]] = {
+    "1,3,7": [1, 3, 7],
+    "1,3,7,14": [1, 3, 7, 14],
+    "1,3,7,14,30": [1, 3, 7, 14, 30],
+}
+SPACED_CHOICES = [
+    app_commands.Choice(name="1, 3, 7 days", value="1,3,7"),
+    app_commands.Choice(name="1, 3, 7, 14 days", value="1,3,7,14"),
+    app_commands.Choice(name="1, 3, 7, 14, 30 days", value="1,3,7,14,30"),
+]
+
+_DATE_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d")
+
+
+def register_commands(
+    tree: app_commands.CommandTree[discord.Client],
+    settings: Settings,
+    leetcode_client: LeetCodeClient,
+    scheduler: ReminderScheduler,
+) -> None:
+    @tree.command(name="remind", description="Schedule a reminder to revisit a LeetCode problem.")
+    @app_commands.describe(
+        problem="LeetCode number, slug, or URL, e.g. 2314, two-sum, or a problem URL",
+        minutes="Remind in this many minutes (combines with hours/days)",
+        hours="Remind in this many hours (combines with minutes/days)",
+        days="Remind in this many days (combines with minutes/hours)",
+        date="Specific date/time in server time: YYYY-MM-DD or YYYY-MM-DD HH:MM",
+        spaced="Spaced repetition: create several reminders at once",
+    )
+    @app_commands.choices(spaced=SPACED_CHOICES)
+    async def remind(
+        interaction: discord.Interaction,
+        problem: str,
+        minutes: app_commands.Range[int, 1, MAX_MINUTES] | None = None,
+        hours: app_commands.Range[int, 1, MAX_HOURS] | None = None,
+        days: app_commands.Range[int, 1, MAX_DAYS] | None = None,
+        date: str | None = None,
+        spaced: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        if interaction.guild_id is None or interaction.channel_id is None:
+            await interaction.response.send_message("Run `/remind` inside a server channel.", ephemeral=True)
+            return
+
+        now = datetime.now(timezone.utc)
+        try:
+            fire_times = _resolve_fire_times(now, minutes, hours, days, date, spaced)
+        except _TimingError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            info = await leetcode_client.resolve_problem(problem)
+        except LeetCodeError as exc:
+            await interaction.followup.send(f"I could not find that LeetCode problem: {exc}")
+            return
+        except Exception:
+            LOGGER.exception("Unexpected error while resolving /remind problem")
+            await interaction.followup.send("Unexpected error while looking up the problem. Check the bot logs for details.")
+            return
+
+        group_id = uuid.uuid4().hex
+        for fire_at in fire_times:
+            reminder = Reminder(
+                id=uuid.uuid4().hex,
+                group_id=group_id,
+                user_id=interaction.user.id,
+                channel_id=interaction.channel_id,
+                guild_id=interaction.guild_id,
+                frontend_id=info.frontend_id,
+                title=info.title,
+                slug=info.slug,
+                fire_at=fire_at,
+                created_at=now,
+            )
+            await scheduler.add(reminder)
+
+        url = f"https://leetcode.com/problems/{info.slug}/"
+        header = f"⏰ Reminder set for `{info.frontend_id}. {info.title}` ({url})"
+        if len(fire_times) == 1:
+            body = f"\nI will ping you here {_discord_ts(fire_times[0])}."
+        else:
+            lines = "\n".join(f"- {_discord_ts(ft)}" for ft in fire_times)
+            body = f"\nI will ping you here at {len(fire_times)} times:\n{lines}"
+        await interaction.followup.send(header + body)
+
+    @tree.command(name="reminders", description="List your pending LeetCode reminders.")
+    async def reminders(interaction: discord.Interaction) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        pending = await scheduler.store.list_user(interaction.user.id)
+        if not pending:
+            await interaction.response.send_message("You have no pending reminders.", ephemeral=True)
+            return
+
+        lines = ["Your pending reminders:"]
+        lines.extend(
+            f"- `{r.frontend_id}. {r.title}` {_discord_ts(r.fire_at)} (`{r.id[:8]}`)" for r in pending
+        )
+        view = ClearAllView(owner_id=interaction.user.id, scheduler=scheduler)
+        await interaction.response.send_message("\n".join(lines), view=view, ephemeral=True)
+
+
+class ClearAllView(discord.ui.View):
+    def __init__(self, owner_id: int, scheduler: ReminderScheduler) -> None:
+        super().__init__(timeout=5 * 60)
+        self.owner_id = owner_id
+        self.scheduler = scheduler
+
+    @discord.ui.button(label="Clear all", style=discord.ButtonStyle.danger)
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button["ClearAllView"]) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the person who ran the command can clear these.", ephemeral=True)
+            return
+
+        removed = await self.scheduler.cancel_user(self.owner_id)
+        button.disabled = True
+        await interaction.response.edit_message(
+            content=f"Cleared {removed} reminder{'s' if removed != 1 else ''}.",
+            view=self,
+        )
+
+
+class _TimingError(ValueError):
+    pass
+
+
+def _resolve_fire_times(
+    now: datetime,
+    minutes: int | None,
+    hours: int | None,
+    days: int | None,
+    date: str | None,
+    spaced: app_commands.Choice[str] | None,
+) -> list[datetime]:
+    has_delay = any(v is not None for v in (minutes, hours, days))
+    modes_used = sum((has_delay, date is not None, spaced is not None))
+
+    if modes_used == 0:
+        raise _TimingError(
+            "Tell me when: use `minutes`/`hours`/`days`, a `date`, or a `spaced` preset."
+        )
+    if modes_used > 1:
+        raise _TimingError(
+            "Pick one timing method only: a delay (`minutes`/`hours`/`days`), a `date`, or `spaced`."
+        )
+
+    if spaced is not None:
+        offsets = SPACED_PRESETS[spaced.value]
+        return [now + timedelta(days=d) for d in offsets]
+
+    if date is not None:
+        fire_at = _parse_date(date)
+        if fire_at <= now:
+            raise _TimingError("That date is in the past. Pick a future date/time.")
+        return [fire_at]
+
+    delta = timedelta(
+        minutes=minutes or 0,
+        hours=hours or 0,
+        days=days or 0,
+    )
+    return [now + delta]
+
+
+def _parse_date(value: str) -> datetime:
+    text = value.strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            naive = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        # Interpret the naive value as server-local time, then store as UTC.
+        return naive.astimezone().astimezone(timezone.utc)
+    raise _TimingError("Use a date like `2026-06-25` or `2026-06-25 14:30`.")
+
+
+def _discord_ts(dt: datetime) -> str:
+    unix = int(dt.timestamp())
+    return f"<t:{unix}:f> (<t:{unix}:R>)"
+
+
+async def _ensure_allowed_guild(interaction: discord.Interaction, settings: Settings) -> bool:
+    if interaction.guild_id != settings.discord_guild_id:
+        await interaction.response.send_message("This bot is not enabled in this server.", ephemeral=True)
+        return False
+    return True
+</file>
+
+<file path="src/purposes/remind/scheduler.py">
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+
+import discord
+
+from .store import Reminder, ReminderStore
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class ReminderScheduler:
+    """Schedules reminder deliveries and reloads them across restarts."""
+
+    def __init__(self, bot: discord.Client, store: ReminderStore) -> None:
+        self._bot = bot
+        self._store = store
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._started = False
+
+    @property
+    def store(self) -> ReminderStore:
+        return self._store
+
+    async def start(self) -> None:
+        """Load persisted reminders and schedule them. Safe to call repeatedly."""
+        if self._started:
+            return
+        self._started = True
+
+        reminders = self._store.load()
+        for reminder in reminders:
+            self.schedule(reminder)
+        LOGGER.info("Reminder scheduler started with %d pending reminder(s).", len(reminders))
+
+    async def add(self, reminder: Reminder) -> None:
+        """Persist a new reminder and schedule its delivery."""
+        await self._store.add(reminder)
+        self.schedule(reminder)
+
+    def schedule(self, reminder: Reminder) -> None:
+        if reminder.id in self._tasks:
+            return
+        self._tasks[reminder.id] = asyncio.create_task(self._run(reminder))
+
+    async def cancel(self, reminder_id: str) -> None:
+        task = self._tasks.pop(reminder_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        await self._store.remove(reminder_id)
+
+    async def cancel_user(self, user_id: int) -> int:
+        reminders = await self._store.list_user(user_id)
+        for reminder in reminders:
+            task = self._tasks.pop(reminder.id, None)
+            if task is not None and not task.done():
+                task.cancel()
+        return await self._store.remove_user(user_id)
+
+    async def _run(self, reminder: Reminder) -> None:
+        delay = (reminder.fire_at - datetime.now(timezone.utc)).total_seconds()
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        try:
+            await self._fire(reminder)
+        except Exception:
+            LOGGER.exception("Failed to deliver reminder %s", reminder.id)
+        finally:
+            self._tasks.pop(reminder.id, None)
+            await self._store.remove(reminder.id)
+
+    async def _fire(self, reminder: Reminder) -> None:
+        channel = self._bot.get_channel(reminder.channel_id)
+        if channel is None:
+            try:
+                channel = await self._bot.fetch_channel(reminder.channel_id)
+            except discord.HTTPException:
+                LOGGER.warning("Channel %s for reminder %s is unavailable; dropping.", reminder.channel_id, reminder.id)
+                return
+
+        if not isinstance(channel, discord.abc.Messageable):
+            LOGGER.warning("Channel %s for reminder %s is not messageable; dropping.", reminder.channel_id, reminder.id)
+            return
+
+        await channel.send(
+            f"<@{reminder.user_id}> ⏰ Time to revisit LeetCode "
+            f"`{reminder.frontend_id}. {reminder.title}`\n{reminder.url}",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+</file>
+
+<file path="src/purposes/remind/store.py">
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+LOGGER = logging.getLogger(__name__)
+
+DEFAULT_REMINDERS_PATH = Path("data/reminders.json")
+
+
+@dataclass
+class Reminder:
+    id: str
+    group_id: str
+    user_id: int
+    channel_id: int
+    guild_id: int
+    frontend_id: str
+    title: str
+    slug: str
+    fire_at: datetime
+    created_at: datetime
+
+    @property
+    def url(self) -> str:
+        return f"https://leetcode.com/problems/{self.slug}/"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "group_id": self.group_id,
+            "user_id": self.user_id,
+            "channel_id": self.channel_id,
+            "guild_id": self.guild_id,
+            "frontend_id": self.frontend_id,
+            "title": self.title,
+            "slug": self.slug,
+            "fire_at": self.fire_at.isoformat(),
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "Reminder":
+        return cls(
+            id=str(data["id"]),
+            group_id=str(data["group_id"]),
+            user_id=int(data["user_id"]),  # type: ignore[arg-type]
+            channel_id=int(data["channel_id"]),  # type: ignore[arg-type]
+            guild_id=int(data["guild_id"]),  # type: ignore[arg-type]
+            frontend_id=str(data["frontend_id"]),
+            title=str(data["title"]),
+            slug=str(data["slug"]),
+            fire_at=_parse_dt(str(data["fire_at"])),
+            created_at=_parse_dt(str(data["created_at"])),
+        )
+
+
+class ReminderStore:
+    """JSON-backed reminder persistence with an in-memory mirror."""
+
+    def __init__(self, path: Path = DEFAULT_REMINDERS_PATH) -> None:
+        self._path = path
+        self._lock = asyncio.Lock()
+        self._reminders: dict[str, Reminder] = {}
+
+    def load(self) -> list[Reminder]:
+        """Read reminders from disk into memory. Never raises on bad input."""
+        self._reminders = {}
+        if not self._path.exists():
+            return []
+
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Could not read reminders file %s; starting empty.", self._path, exc_info=True)
+            return []
+
+        if not isinstance(raw, list):
+            LOGGER.warning("Reminders file %s is not a list; starting empty.", self._path)
+            return []
+
+        for entry in raw:
+            try:
+                reminder = Reminder.from_dict(entry)
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning("Skipping malformed reminder entry: %r", entry, exc_info=True)
+                continue
+            self._reminders[reminder.id] = reminder
+
+        return list(self._reminders.values())
+
+    async def add(self, reminder: Reminder) -> None:
+        async with self._lock:
+            self._reminders[reminder.id] = reminder
+            self._flush()
+
+    async def remove(self, reminder_id: str) -> None:
+        async with self._lock:
+            if self._reminders.pop(reminder_id, None) is not None:
+                self._flush()
+
+    async def remove_user(self, user_id: int) -> int:
+        async with self._lock:
+            to_remove = [rid for rid, r in self._reminders.items() if r.user_id == user_id]
+            for rid in to_remove:
+                del self._reminders[rid]
+            if to_remove:
+                self._flush()
+            return len(to_remove)
+
+    async def list_user(self, user_id: int) -> list[Reminder]:
+        async with self._lock:
+            reminders = [r for r in self._reminders.values() if r.user_id == user_id]
+        return sorted(reminders, key=lambda r: r.fire_at)
+
+    def _flush(self) -> None:
+        """Atomically rewrite the JSON file. Caller must hold the lock."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [r.to_dict() for r in self._reminders.values()]
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, self._path)
+
+
+def _parse_dt(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+</file>
+
+<file path="src/purposes/formatter/__init__.py">
+
+</file>
+
+<file path="src/purposes/formatter/commands.py">
+from __future__ import annotations
+
+import io
+import logging
+
+import discord
+from discord import app_commands
+
+from ...config import Settings
+from ...services.ai_client import AIClient, AIProviderError
+from .formatters import FORMATTER_CHOICES, extension_for, format_code
+
+LOGGER = logging.getLogger(__name__)
+
+DISCORD_MESSAGE_LIMIT = 2000
+
+
+def register_commands(
+    tree: app_commands.CommandTree[discord.Client],
+    settings: Settings,
+    ai_client: AIClient,
+) -> None:
+    @tree.command(name="code", description="Format pasted code and wrap it in a Discord code block.")
+    @app_commands.describe(language="Language to format as. Leave blank to auto-detect.")
+    @app_commands.choices(language=FORMATTER_CHOICES)
+    async def code(
+        interaction: discord.Interaction,
+        language: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        await interaction.response.send_modal(
+            CodeBlockModal(ai_client, language.value if language else None)
+        )
+
+
+class CodeBlockModal(discord.ui.Modal, title="Format Code"):
+    content = discord.ui.TextInput(
+        label="Code",
+        placeholder="Paste your code here",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+        required=True,
+    )
+
+    def __init__(self, ai_client: AIClient, language: str | None) -> None:
+        super().__init__()
+        self._ai_client = ai_client
+        self._language = language
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+
+        try:
+            formatted, tag = await format_code(str(self.content), self._language, self._ai_client)
+        except AIProviderError as exc:
+            await interaction.followup.send(f"I could not format that code: {exc}")
+            return
+        except Exception:
+            LOGGER.exception("Unexpected error while formatting /code")
+            await interaction.followup.send("Unexpected error while formatting. Check the bot logs for details.")
+            return
+
+        # Each message is "```{tag}\n{body}\n```", so the wrapper costs
+        # len("```") + len(tag) + two newlines + len("```") == 8 + len(tag).
+        safe = formatted.replace("```", "`​``")
+        if len(safe) + 8 + len(tag) <= DISCORD_MESSAGE_LIMIT:
+            # Fits in a single message: send it inline, never chopped.
+            await interaction.followup.send(f"```{tag}\n{safe}\n```")
+            return
+
+        # Too big for one message. Attach the unescaped code as a file so it
+        # arrives whole instead of being split across several code blocks.
+        buffer = io.BytesIO(formatted.encode("utf-8"))
+        file = discord.File(buffer, filename=f"formatted.{extension_for(tag)}")
+        await interaction.followup.send(
+            f"Formatted `{tag}` ({len(formatted)} chars) — too long for one message, attached as a file:",
+            file=file,
+        )
+
+
+async def _ensure_allowed_guild(interaction: discord.Interaction, settings: Settings) -> bool:
+    if interaction.guild_id != settings.discord_guild_id:
+        await interaction.response.send_message("This bot is not enabled in this server.", ephemeral=True)
+        return False
+    return True
+</file>
+
+<file path="src/purposes/formatter/formatters.py">
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import shutil
+from dataclasses import dataclass
+
+from discord import app_commands
+
+from ...services.ai_client import AIClient
+
+LOGGER = logging.getLogger(__name__)
+
+SUBPROCESS_TIMEOUT_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class FormatterSpec:
+    """How to run a real, installed formatter for a language.
+
+    The code is always piped over stdin and the formatted result is read from
+    stdout, so `argv` must name a tool that supports stdin/stdout filtering.
+    """
+
+    argv: tuple[str, ...]
+
+    @property
+    def tool(self) -> str:
+        return self.argv[0]
+
+
+# Language value -> real formatter that reads stdin and writes stdout.
+# The value strings double as the Discord syntax-highlight tag.
+FORMATTERS: dict[str, FormatterSpec] = {
+    "python": FormatterSpec(("black", "-q", "-")),
+    "javascript": FormatterSpec(("prettier", "--stdin-filepath", "file.js")),
+    "typescript": FormatterSpec(("prettier", "--stdin-filepath", "file.ts")),
+    "json": FormatterSpec(("prettier", "--stdin-filepath", "file.json")),
+    "css": FormatterSpec(("prettier", "--stdin-filepath", "file.css")),
+    "html": FormatterSpec(("prettier", "--stdin-filepath", "file.html")),
+    "go": FormatterSpec(("gofmt",)),
+    "rust": FormatterSpec(("rustfmt", "--emit", "stdout")),
+    "cpp": FormatterSpec(("clang-format",)),
+    "java": FormatterSpec(("clang-format", "--assume-filename=file.java")),
+}
+
+# Dropdown shown on the /code command. `value` is the Discord syntax tag.
+FORMATTER_CHOICES = [
+    app_commands.Choice(name="Python", value="python"),
+    app_commands.Choice(name="JavaScript", value="javascript"),
+    app_commands.Choice(name="TypeScript", value="typescript"),
+    app_commands.Choice(name="JSON", value="json"),
+    app_commands.Choice(name="CSS", value="css"),
+    app_commands.Choice(name="HTML", value="html"),
+    app_commands.Choice(name="Go", value="go"),
+    app_commands.Choice(name="Rust", value="rust"),
+    app_commands.Choice(name="C++", value="cpp"),
+    app_commands.Choice(name="Java", value="java"),
+]
+
+_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+
+# Syntax tag (incl. common LLM-detected aliases) -> file extension for attachments.
+_EXTENSIONS = {
+    "python": "py",
+    "py": "py",
+    "javascript": "js",
+    "js": "js",
+    "typescript": "ts",
+    "ts": "ts",
+    "json": "json",
+    "css": "css",
+    "html": "html",
+    "go": "go",
+    "rust": "rs",
+    "rs": "rs",
+    "cpp": "cpp",
+    "c++": "cpp",
+    "c": "c",
+    "java": "java",
+    "csharp": "cs",
+    "c#": "cs",
+    "kotlin": "kt",
+    "ruby": "rb",
+    "php": "php",
+    "swift": "swift",
+    "bash": "sh",
+    "sh": "sh",
+    "shell": "sh",
+    "sql": "sql",
+    "yaml": "yaml",
+    "yml": "yaml",
+}
+
+
+def extension_for(tag: str) -> str:
+    """Map a syntax tag to a file extension for attachments; default to txt."""
+    return _EXTENSIONS.get(tag.lower(), "txt")
+
+
+async def format_code(code: str, language: str | None, ai_client: AIClient) -> tuple[str, str]:
+    """Format `code` and return (formatted_code, syntax_tag).
+
+    Hybrid strategy: when a language is chosen and a real formatter for it is
+    installed, shell out to that tool. Otherwise (no language, missing tool, or a
+    formatter failure) fall back to the LLM, which also detects the language when
+    none was given.
+    """
+    code = code.strip()
+    if language:
+        formatted = await _run_real_formatter(code, language)
+        if formatted is not None:
+            return formatted, language
+
+    return await _llm_format(code, language, ai_client)
+
+
+async def _run_real_formatter(code: str, language: str) -> str | None:
+    """Run the installed formatter for `language`; return None to fall back to the LLM."""
+    spec = FORMATTERS.get(language)
+    if spec is None or shutil.which(spec.tool) is None:
+        return None
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *spec.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        LOGGER.exception("Could not launch formatter %s", spec.tool)
+        return None
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(input=code.encode("utf-8")),
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        LOGGER.warning("Formatter %s timed out", spec.tool)
+        return None
+
+    if process.returncode != 0:
+        LOGGER.warning(
+            "Formatter %s exited with %s: %s",
+            spec.tool,
+            process.returncode,
+            stderr.decode("utf-8", "replace").strip()[:300],
+        )
+        return None
+
+    formatted = stdout.decode("utf-8", "replace").strip()
+    return formatted or None
+
+
+async def _llm_format(code: str, language: str | None, ai_client: AIClient) -> tuple[str, str]:
+    answer = await ai_client.complete(_build_format_messages(code, language))
+    tag, body = extract_fenced_code(answer.content)
+    syntax_tag = language or tag or "text"
+    return body, syntax_tag
+
+
+def _build_format_messages(code: str, language: str | None) -> list[dict[str, str]]:
+    if language:
+        target = f"The code is written in {language}."
+    else:
+        target = "Detect the programming language yourself."
+
+    system = (
+        "You are a code formatter, like Prettier or Black. Reformat the code the user gives "
+        "you to clean, idiomatic, industry-standard style. "
+        "Only change whitespace, indentation, and layout. Do NOT change logic, rename anything, "
+        "add or remove comments, or explain anything. "
+        f"{target} "
+        "Respond with exactly one Markdown code block whose info string is the correct language "
+        "tag (for example ```python), containing only the formatted code and nothing else."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Format this code:\n{code}"},
+    ]
+
+
+def extract_fenced_code(text: str) -> tuple[str, str]:
+    """Pull (language_tag, body) out of the first fenced block in `text`.
+
+    Falls back to ("", stripped text) when no fence is present.
+    """
+    match = _FENCE_RE.search(text)
+    if match is None:
+        return "", text.strip()
+    return match.group(1).strip(), match.group(2).strip()
+</file>
+
+<file path="src/purposes/leetcode/__init__.py">
+
+</file>
+
+<file path="src/purposes/leetcode/commands.py">
+from __future__ import annotations
+
+import logging
+import re
+
+import discord
+from discord import app_commands
+
+from ...config import Settings
+from ...services.ai_client import AIClient, AIProviderError
+from .leetcode_client import LeetCodeClient, LeetCodeError
+from .models import MODEL_ALLOWLIST, MODEL_CHOICES
+from .tutor import build_messages, build_pseudocode_messages, chunk_for_discord
+
+
+LOGGER = logging.getLogger(__name__)
+
+LEETCODE_SIGNALS = (
+    "leetcode",
+    "algorithm",
+    "data structure",
+    "complexity",
+    "dp",
+    "dynamic programming",
+    "greedy",
+    "bfs",
+    "dfs",
+    "binary search",
+    "two pointers",
+    "sliding window",
+    "linked list",
+    "tree",
+    "graph",
+    "stack",
+    "queue",
+    "heap",
+)
+
+
+def register_commands(
+    tree: app_commands.CommandTree[discord.Client],
+    settings: Settings,
+    ai_client: AIClient,
+    leetcode_client: LeetCodeClient,
+) -> None:
+    @tree.command(name="models", description="Show allowed OpenRouter model choices.")
+    async def models(interaction: discord.Interaction) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        lines = [f"Default: `{settings.openrouter_model_key}` -> `{settings.openrouter_model_id}`", "", "Allowed models:"]
+        lines.extend(f"- `{key}` -> `{model_id}`" for key, model_id in MODEL_ALLOWLIST.items())
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @tree.command(name="leetcode", description="Start a tutoring thread for a LeetCode problem.")
+    @app_commands.describe(problem="LeetCode number, slug, or URL, e.g. 2314, two-sum, or a problem URL")
+    async def leetcode(interaction: discord.Interaction, problem: str) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "Run `/leetcode` from a normal text channel so I can open a thread.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            info = await leetcode_client.resolve_problem(problem)
+        except LeetCodeError as exc:
+            await interaction.followup.send(f"I could not find that LeetCode problem: {exc}")
+            return
+        except Exception:
+            LOGGER.exception("Unexpected error while resolving /leetcode problem")
+            await interaction.followup.send("Unexpected error while looking up the problem. Check the bot logs for details.")
+            return
+
+        url = f"https://leetcode.com/problems/{info.slug}/"
+        thread = await interaction.channel.create_thread(
+            name=f"{info.frontend_id} - {info.title}"[:100],
+            type=discord.ChannelType.public_thread,
+        )
+        try:
+            await thread.add_user(interaction.user)
+        except discord.HTTPException:
+            LOGGER.exception("Could not add /leetcode user to created thread")
+
+        await interaction.followup.send(
+            f"🧩 Tutoring thread started for `{info.frontend_id}. {info.title}` → {thread.mention}"
+        )
+        await thread.send(
+            f"{info.frontend_id}. {info.title}\n"
+            f"Difficulty: {info.difficulty}\n"
+            f"Link: {url}"
+        )
+
+    @tree.command(
+        name="delete",
+        description="Delete a LeetCode tutoring thread and its announcement message by problem number.",
+    )
+    @app_commands.describe(problem_number="LeetCode problem number, e.g. 1344")
+    async def delete(interaction: discord.Interaction, problem_number: str) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        number = problem_number.strip()
+        if not number.isdigit():
+            await interaction.response.send_message(
+                "Give me just the LeetCode problem number, e.g. `1344`.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.guild is None:
+            await interaction.response.send_message("Run `/delete` inside the server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        thread = await _find_problem_thread(interaction.guild, interaction.channel, number)
+        if thread is None:
+            await interaction.followup.send(
+                f"I could not find a tutoring thread for problem `{number}`."
+            )
+            return
+
+        bot_user = interaction.client.user
+        thread_name = thread.name
+        deleted_message = False
+        deleted_notice = False
+        if isinstance(thread.parent, discord.TextChannel):
+            try:
+                async for message in thread.parent.history(limit=200):
+                    is_announcement = (
+                        bot_user is not None
+                        and message.author.id == bot_user.id
+                        and f"<#{thread.id}>" in message.content
+                    )
+                    # Discord's auto-posted "X started a thread: <name>" system message.
+                    is_notice = (
+                        message.type is discord.MessageType.thread_created
+                        and message.content == thread_name
+                    )
+                    if is_announcement or is_notice:
+                        await message.delete()
+                        deleted_message = deleted_message or is_announcement
+                        deleted_notice = deleted_notice or is_notice
+                    if deleted_message and deleted_notice:
+                        break
+            except discord.HTTPException:
+                LOGGER.exception("Failed while deleting /leetcode channel messages")
+
+        try:
+            await thread.delete()
+        except discord.HTTPException as exc:
+            await interaction.followup.send(f"I found the thread but could not delete it: {exc}")
+            return
+
+        summary = f"Deleted thread `{thread_name}`."
+        summary += (
+            " Removed its announcement message."
+            if deleted_message
+            else " No announcement message found to remove."
+        )
+        summary += (
+            " Removed the thread-created notice."
+            if deleted_notice
+            else " No thread-created notice found to remove."
+        )
+        await interaction.followup.send(summary)
+
+    @tree.command(name="pseudocode", description="Format raw algorithm notes for Discord.")
+    @app_commands.describe(raw_list="Paste your raw algorithm or process list here")
+    async def pseudocode(interaction: discord.Interaction, raw_list: str) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            answer = await ai_client.complete(build_pseudocode_messages(raw_list))
+        except AIProviderError as exc:
+            await interaction.followup.send(f"I could not format the pseudocode: {exc}")
+            return
+        except Exception:
+            LOGGER.exception("Unexpected error while formatting /pseudocode")
+            await interaction.followup.send("Unexpected error while formatting. Check the bot logs for details.")
+            return
+
+        chunks = chunk_for_discord(_clean_pseudocode_response(answer.content))
+        await interaction.followup.send(chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk)
+
+
+async def answer_mention(message: discord.Message, ai_client: AIClient, question: str, context: str = "") -> None:
+    async with message.channel.typing():
+        messages = build_messages(question, context=context)
+        try:
+            answer = await ai_client.complete(messages)
+        except AIProviderError as exc:
+            await message.reply(f"I could not get an AI response: {exc}", mention_author=False)
+            return
+        except Exception:
+            LOGGER.exception("Unexpected error while answering LeetCode mention")
+            await message.reply("Unexpected error while answering. Check the bot logs for details.", mention_author=False)
+            return
+
+    prefix = f"Model: `{answer.provider}` / `{answer.model}`"
+    if answer.used_fallback:
+        prefix += "\nOpenRouter failed, answered with DeepSeek fallback."
+
+    chunks = chunk_for_discord(answer.content)
+    await message.reply(f"{prefix}\n\n{chunks[0]}", mention_author=False)
+    for chunk in chunks[1:]:
+        await message.channel.send(chunk)
+
+
+def looks_like_leetcode(text: str, channel_name: str | None = None) -> bool:
+    haystack = f"{channel_name or ''} {text}".lower()
+    if "leetcode.com/problems/" in haystack:
+        return True
+    if any(signal in haystack for signal in LEETCODE_SIGNALS):
+        return True
+    return bool(re.search(r"\bproblem\s*#?\d+\b|\bquestion\s*#?\d+\b", haystack))
+
+
+async def _find_problem_thread(
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel | None,
+    number: str,
+) -> discord.Thread | None:
+    prefix = f"{number} - "
+
+    for thread in await guild.active_threads():
+        if thread.name.startswith(prefix):
+            return thread
+
+    if isinstance(channel, discord.TextChannel):
+        async for thread in channel.archived_threads(limit=100):
+            if thread.name.startswith(prefix):
+                return thread
+
+    return None
+
+
+def _clean_pseudocode_response(content: str) -> str:
+    lines = [line for line in content.replace("\\`", "`").splitlines() if line.strip() not in {"---", "***"}]
+    return "\n".join(lines).strip()
+
+
+async def _ensure_allowed_guild(interaction: discord.Interaction, settings: Settings) -> bool:
+    if interaction.guild_id != settings.discord_guild_id:
+        await interaction.response.send_message("This bot is not enabled in this server.", ephemeral=True)
+        return False
+    return True
+</file>
+
+<file path="src/purposes/leetcode/leetcode_client.py">
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+import httpx
+
+
+class LeetCodeError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ProblemInfo:
+    frontend_id: str
+    title: str
+    slug: str
+    difficulty: str
+
+
+class LeetCodeClient:
+    def __init__(self) -> None:
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/json",
+                "Origin": "https://leetcode.com",
+            },
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def resolve_problem(self, problem: str) -> ProblemInfo:
+        parsed = _parse_problem_input(problem)
+        if parsed[0] == "slug":
+            return await self._fetch_problem_by_slug(parsed[1])
+        return await self._fetch_problem_by_number(parsed[1])
+
+    async def _fetch_problem_by_slug(self, slug: str) -> ProblemInfo:
+        query = """
+        query question($titleSlug: String!) {
+          question(titleSlug: $titleSlug) {
+            questionFrontendId
+            title
+            titleSlug
+            difficulty
+          }
+        }
+        """
+        data = await self._graphql(query, {"titleSlug": slug}, referer=f"https://leetcode.com/problems/{slug}/")
+        question = data.get("question")
+        if not question:
+            raise LeetCodeError(f"Could not find LeetCode problem slug `{slug}`.")
+        return ProblemInfo(
+            frontend_id=question["questionFrontendId"],
+            title=question["title"],
+            slug=question["titleSlug"],
+            difficulty=question["difficulty"],
+        )
+
+    async def _fetch_problem_by_number(self, number: str) -> ProblemInfo:
+        query = """
+        query questionList($filters: QuestionListFilterInput) {
+          questionList(categorySlug: "all-code-essentials", limit: 20, skip: 0, filters: $filters) {
+            data {
+              questionFrontendId
+              title
+              titleSlug
+              difficulty
+            }
+          }
+        }
+        """
+        data = await self._graphql(query, {"filters": {"searchKeywords": number}}, referer="https://leetcode.com/problemset/")
+        questions = data.get("questionList", {}).get("data", [])
+        for question in questions:
+            if question.get("questionFrontendId") == number:
+                return ProblemInfo(
+                    frontend_id=question["questionFrontendId"],
+                    title=question["title"],
+                    slug=question["titleSlug"],
+                    difficulty=question["difficulty"],
+                )
+        raise LeetCodeError(f"Could not find LeetCode problem number `{number}`.")
+
+    async def _graphql(self, query: str, variables: dict[str, object], referer: str) -> dict[str, object]:
+        try:
+            response = await self._client.post(
+                "https://leetcode.com/graphql",
+                json={"query": query, "variables": variables},
+                headers={"Referer": referer},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise LeetCodeError(f"LeetCode returned HTTP {exc.response.status_code}.") from exc
+        except httpx.HTTPError as exc:
+            raise LeetCodeError(f"LeetCode request failed: {exc.__class__.__name__}.") from exc
+
+        payload = response.json()
+        if payload.get("errors"):
+            message = payload["errors"][0].get("message", "unknown GraphQL error")
+            raise LeetCodeError(f"LeetCode GraphQL error: {message}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise LeetCodeError("LeetCode returned an unexpected response format.")
+        return data
+
+
+def _parse_problem_input(problem: str) -> tuple[str, str]:
+    value = problem.strip()
+    if not value:
+        raise LeetCodeError("Problem must be a number, slug, or LeetCode problem URL.")
+
+    if value.isdigit():
+        return ("number", value)
+
+    parsed = urlparse(value)
+    if parsed.netloc and "leetcode.com" in parsed.netloc:
+        match = re.search(r"/problems/([^/]+)/?", parsed.path)
+        if not match:
+            raise LeetCodeError("LeetCode URL must contain `/problems/<slug>`.")
+        return ("slug", match.group(1))
+
+    slug = value.strip("/").split("/")[-1]
+    if not re.fullmatch(r"[a-z0-9-]+", slug):
+        raise LeetCodeError("Problem slug can only contain lowercase letters, numbers, and hyphens.")
+    return ("slug", slug)
+</file>
+
+<file path="src/purposes/leetcode/models.py">
+from __future__ import annotations
+
+from discord import app_commands
+
+from ...services.models import MODEL_ALLOWLIST
+
+MODEL_CHOICES = [
+    app_commands.Choice(name="DeepSeek R1", value="deepseek-r1"),
+    app_commands.Choice(name="DeepSeek Chat", value="deepseek-chat"),
+    app_commands.Choice(name="GPT-4o Mini", value="gpt-4o-mini"),
+    app_commands.Choice(name="GPT-4.1 Mini", value="gpt-4.1-mini"),
+    app_commands.Choice(name="Claude Sonnet", value="claude-sonnet"),
+    app_commands.Choice(name="Gemini Flash", value="gemini-flash"),
+    app_commands.Choice(name="Llama 405B", value="llama-405b"),
+]
+</file>
+
+<file path="src/purposes/leetcode/tutor.py">
+from __future__ import annotations
+
+# chunk_for_discord now lives in a shared module so other purposes can reuse it.
+# Re-exported here to keep existing `from .tutor import chunk_for_discord` imports working.
+from ...services.discord_text import chunk_for_discord
+
+__all__ = ["SYSTEM_PROMPT", "build_messages", "build_pseudocode_messages", "chunk_for_discord"]
+
+
+SYSTEM_PROMPT = """I want to discuss a LeetCode problem. Act as my technical interviewer and LeetCode assistant.
+
+Here are the strict rules for our session:
+1. Do NOT give me the final code, answer, algorithm, or direct hints unless I explicitly ask you to.
+2. If I ask you to explain the problem, break it down using simple terms and real-world analogies, but leave the algorithmic approach up to me.
+3. If I suggest an approach, such as DP, Greedy, BFS, DFS, two pointers, binary search, or another pattern, tell me whether I am on the right track. If I am wrong, gently point out why the approach might fail, such as time complexity, state tracking, edge cases, or correctness, and guide me toward the correct pattern without giving away the full solution unless I explicitly ask.
+4. When I explicitly ask for the solution, provide clean, well-commented Java code, time and space complexity analysis, and the general mental boilerplate for that specific algorithm pattern.
+5. Your solution should reflect the official LeetCode solution or optimal community solutions, returning the most elegant and effective version you know.
+6. Use the recent channel/thread context to identify the active LeetCode problem. If the user says "this question", "today's question", "explain this", or similar, infer the problem number, title, tags, and link from the recent context before answering.
+7. If the recent context does not contain enough information to identify the problem, ask the user for the problem number, title, link, or statement.
+8. Write explanations in plain beginner-friendly English. Avoid LaTeX, math-mode syntax, arrows, and developer-style Markdown unless the user explicitly asks for code. For example, write "A trusts B" instead of "$A \\rightarrow B$", and write "N minus 1" instead of "$N - 1$".
+9. Do not wrap ordinary terms in backticks. Use simple bullet points and short sentences so the answer is easy to read in Discord.
+
+Keep responses concise enough for Discord. If the user asks something unrelated to LeetCode or programming interviews, briefly redirect back to the LeetCode assistant session.
+"""
+
+PSEUDOCODE_FORMATTER_PROMPT = """Act as an expert technical writer and senior software engineer. The user has a raw list describing an algorithm or process. Evaluate its style and format it perfectly for Discord.
+
+Do NOT debug or change the underlying logic of the algorithm. Focus entirely on formatting and readability.
+
+Format your response exactly following this structure and keep the full response under 1800 characters:
+
+**1. The Before:** Show the user's raw list as a lightly formatted version inside a text code block. Break the wall of text into one clear idea per line, fix spacing, and preserve the original wording and logic as much as possible.
+**2. The After:** Provide the polished, industry-standard pseudocode inside a text code block.
+
+Do not add horizontal rules or separators. Do not escape the backticks for code blocks. Use real triple backticks so Discord renders the blocks correctly.
+
+Strict formatting rules for "The After":
+1. Wrap the entire "After" output inside a triple-backtick markdown code block specifying text.
+2. You MUST use and capitalize the following standardized pseudocode keywords where applicable:
+    - Variables: INITIALIZE, SET, COMPUTE, INCREMENT, DECREMENT
+    - Control Flow: IF, THEN, ELSE IF, ELSE, MATCH, CASE
+    - Loops: FOR, FOR EACH, WHILE, BREAK, CONTINUE
+    - Execution: FUNCTION, CALL, RETURN, YIELD
+    - Logic: AND, OR, NOT, TRUE, FALSE, NULL
+3. Highlight all programming variables, data structures, and code snippets using inline backticks, such as `trust[0]` and `-1`.
+4. For sub-steps, indent them using exactly four spaces.
+5. Format the steps using a logical numbering hierarchy, such as 1, 2, 2.1, 2.2. Infer the logical main steps and sub-steps based on the flow.
+6. Keep the pseudocode language-neutral and generic. Prefer "dictionary mapping integers to lists of integers" over language-specific types such as `HashMap<Integer, List<Integer>>`, and prefer "empty list" over `List` when describing values.
+7. Keep programming symbols only for true variables, indexes, constants, and expressions. Do not wrap generic English phrases such as fixed-size array, dictionary, or empty list in backticks.
+8. End complete pseudocode statements with periods. Do not put a comma before THEN, such as "IF `N` == `0` THEN:".
+9. When a condition has multiple checks joined by AND, split it into nested IF steps if that improves readability.
+"""
+
+
+def build_messages(question: str, context: str = "") -> list[dict[str, str]]:
+    context_block = f"Recent channel/thread context:\n{context.strip()}\n\n" if context.strip() else ""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "The problem we are working on is below. Follow the strict interviewer/assistant rules.\n\n"
+                f"{context_block}"
+                f"User message:\n{question.strip()}"
+            ),
+        },
+    ]
+
+
+def build_pseudocode_messages(raw_list: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": PSEUDOCODE_FORMATTER_PROMPT},
+        {
+            "role": "user",
+            "content": f"Here is the raw list to format:\n{raw_list.strip()}",
+        },
+    ]
+</file>
+
+<file path="src/purposes/timer/__init__.py">
+
+</file>
+
+<file path="src/purposes/timer/commands.py">
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import discord
+from discord import app_commands
+
+from ...config import Settings
+
+
+LOGGER = logging.getLogger(__name__)
+MAX_TIMER_MINUTES = 24 * 60
+
+
+def register_commands(tree: app_commands.CommandTree[discord.Client], settings: Settings) -> None:
+    @tree.command(name="timer", description="Create a countdown timer with a start button.")
+    @app_commands.describe(minutes="Timer length in minutes, from 1 to 1440")
+    async def timer(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]) -> None:
+        if not await _ensure_allowed_guild(interaction, settings):
+            return
+
+        view = TimerStartView(minutes=minutes, owner_id=interaction.user.id)
+        await interaction.response.send_message(
+            f"Timer ready for `{minutes}` minute{'s' if minutes != 1 else ''}. Click Start when you are ready.",
+            view=view,
+        )
+
+
+class TimerStartView(discord.ui.View):
+    def __init__(self, minutes: int, owner_id: int) -> None:
+        super().__init__(timeout=15 * 60)
+        self.minutes = minutes
+        self.owner_id = owner_id
+        self.started = False
+        self.task: asyncio.Task[None] | None = None
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button["TimerStartView"]) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the timer creator can start this timer.", ephemeral=True)
+            return
+
+        if self.started:
+            await interaction.response.send_message("This timer has already started.", ephemeral=True)
+            return
+
+        self.started = True
+        button.disabled = True
+        button.label = "Started"
+        self.task = asyncio.create_task(_finish_timer(interaction, self.minutes))
+        await interaction.response.edit_message(
+            content=(
+                f"Timer started for `{self.minutes}` minute{'s' if self.minutes != 1 else ''}. "
+                f"I will ping {interaction.user.mention} when it ends."
+            ),
+            view=self,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button["TimerStartView"]) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the timer creator can cancel this timer.", ephemeral=True)
+            return
+
+        if self.task and not self.task.done():
+            self.task.cancel()
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(
+            content=f"Timer cancelled by {interaction.user.mention}.",
+            view=self,
+        )
+
+
+async def _finish_timer(interaction: discord.Interaction, minutes: int) -> None:
+    try:
+        await asyncio.sleep(minutes * 60)
+    except asyncio.CancelledError:
+        return
+
+    try:
+        await interaction.channel.send(  # type: ignore[union-attr]
+            f"{interaction.user.mention} timer done: `{minutes}` minute{'s' if minutes != 1 else ''} finished.",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except Exception:
+        LOGGER.exception("Failed to send timer completion message")
+
+
+async def _ensure_allowed_guild(interaction: discord.Interaction, settings: Settings) -> bool:
+    if interaction.guild_id != settings.discord_guild_id:
+        await interaction.response.send_message("This bot is not enabled in this server.", ephemeral=True)
+        return False
+    return True
+</file>
+
+<file path="src/purposes/__init__.py">
+
+</file>
+
+<file path="src/services/__init__.py">
+
+</file>
+
+<file path="src/services/ai_client.py">
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+import httpx
+
+from ..config import Settings
+from .models import MODEL_ALLOWLIST
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class AIProviderError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class AIResponse:
+    content: str
+    provider: str
+    model: str
+    used_fallback: bool = False
+
+
+class AIClient:
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0))
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def complete(self, messages: list[dict[str, str]], model_key: str | None = None) -> AIResponse:
+        selected_model_key = model_key or self._settings.openrouter_model_key
+        if selected_model_key not in MODEL_ALLOWLIST:
+            allowed = ", ".join(sorted(MODEL_ALLOWLIST))
+            raise AIProviderError(f"Unsupported model. Choose one of: {allowed}")
+
+        openrouter_model = MODEL_ALLOWLIST[selected_model_key]
+        try:
+            content = await self._openrouter_complete(messages, openrouter_model)
+            return AIResponse(content=content, provider="OpenRouter", model=openrouter_model)
+        except Exception as exc:
+            LOGGER.warning("OpenRouter request failed, trying DeepSeek fallback: %s", exc)
+
+        if not self._settings.deepseek_api_key:
+            raise AIProviderError("OpenRouter failed and DEEPSEEK_API_KEY is not configured for fallback.")
+
+        content = await self._deepseek_complete(messages)
+        return AIResponse(
+            content=content,
+            provider="DeepSeek",
+            model=self._settings.deepseek_model,
+            used_fallback=True,
+        )
+
+    async def _openrouter_complete(self, messages: list[dict[str, str]], model: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self._settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+            "X-Title": self._settings.openrouter_app_name,
+        }
+        if self._settings.openrouter_site_url:
+            headers["HTTP-Referer"] = self._settings.openrouter_site_url
+
+        return await self._post_chat_completion(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            payload={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.4,
+            },
+            provider="OpenRouter",
+        )
+
+    async def _deepseek_complete(self, messages: list[dict[str, str]]) -> str:
+        headers = {
+            "Authorization": f"Bearer {self._settings.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        return await self._post_chat_completion(
+            url="https://api.deepseek.com/chat/completions",
+            headers=headers,
+            payload={
+                "model": self._settings.deepseek_model,
+                "messages": messages,
+                "temperature": 0.4,
+            },
+            provider="DeepSeek",
+        )
+
+    async def _post_chat_completion(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object],
+        provider: str,
+    ) -> str:
+        try:
+            response = await self._client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _safe_error_detail(exc.response)
+            raise AIProviderError(f"{provider} returned HTTP {exc.response.status_code}: {detail}") from exc
+        except httpx.HTTPError as exc:
+            raise AIProviderError(f"{provider} request failed: {exc.__class__.__name__}") from exc
+
+        data = response.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AIProviderError(f"{provider} returned an unexpected response format") from exc
+
+        if not isinstance(content, str) or not content.strip():
+            raise AIProviderError(f"{provider} returned an empty response")
+        return content.strip()
+
+
+def _safe_error_detail(response: httpx.Response) -> str:
+    text = response.text.strip().replace("\n", " ")
+    if not text:
+        return "no response body"
+    return text[:300]
+</file>
+
+<file path="src/services/context.py">
+from __future__ import annotations
+
+import re
+
+import discord
+
+
+async def collect_recent_context(
+    channel: discord.abc.Messageable,
+    *,
+    before: discord.Message | None = None,
+    limit: int = 12,
+    max_chars: int = 3500,
+) -> str:
+    if not hasattr(channel, "history"):
+        return ""
+
+    messages: list[str] = []
+    history = channel.history(limit=limit, before=before, oldest_first=True)  # type: ignore[attr-defined]
+    async for message in history:
+        content = _message_text(message)
+        if not content:
+            continue
+        author = getattr(message.author, "display_name", message.author.name)
+        messages.append(f"{author}: {content}")
+
+    context = "\n".join(messages).strip()
+    if len(context) <= max_chars:
+        return context
+    return context[-max_chars:].lstrip()
+
+
+def _message_text(message: discord.Message) -> str:
+    parts: list[str] = []
+    content = _clean_content(message.clean_content)
+    if content:
+        parts.append(content)
+
+    for embed in message.embeds:
+        embed_parts = []
+        if embed.title:
+            embed_parts.append(embed.title)
+        if embed.description:
+            embed_parts.append(embed.description)
+        for field in embed.fields[:4]:
+            embed_parts.append(f"{field.name}: {field.value}")
+        if embed_parts:
+            parts.append(" | ".join(_clean_content(part) for part in embed_parts if part))
+
+    return " ".join(parts).strip()
+
+
+def _clean_content(content: str) -> str:
+    content = re.sub(r"\s+", " ", content).strip()
+    return content[:800]
+</file>
+
+<file path="src/services/discord_text.py">
+from __future__ import annotations
+
+
+def chunk_for_discord(text: str, limit: int = 1900) -> list[str]:
+    text = text.strip()
+    if not text:
+        return ["I did not receive a response from the model."]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+</file>
+
+<file path="src/services/models.py">
+from __future__ import annotations
+
+
+MODEL_ALLOWLIST = {
+    "deepseek-r1": "deepseek/deepseek-r1",
+    "deepseek-chat": "deepseek/deepseek-chat-v3-0324",
+    "gpt-4o-mini": "openai/gpt-4o-mini",
+    "gpt-4.1-mini": "openai/gpt-4.1-mini",
+    "claude-sonnet": "anthropic/claude-3.5-sonnet",
+    "gemini-flash": "google/gemini-3.5-flash",
+    "llama-405b": "meta-llama/llama-3.1-405b-instruct",
+}
+</file>
+
+<file path="src/__init__.py">
+
+</file>
+
+<file path="src/config.py">
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+from .services.models import MODEL_ALLOWLIST
+
+
+@dataclass(frozen=True)
+class Settings:
+    discord_bot_token: str
+    discord_guild_id: int
+    discord_channel_id: int | None
+    openrouter_api_key: str
+    openrouter_model_key: str
+    openrouter_app_name: str
+    openrouter_site_url: str | None
+    deepseek_api_key: str | None
+    deepseek_model: str
+
+    @property
+    def openrouter_model_id(self) -> str:
+        return MODEL_ALLOWLIST[self.openrouter_model_key]
+
+
+def load_settings() -> Settings:
+    load_dotenv()
+
+    discord_bot_token = _required("DISCORD_BOT_TOKEN")
+    discord_guild_id = _required_int("DISCORD_GUILD_ID")
+    discord_channel_id = _optional_int("DISCORD_CHANNEL_ID")
+    openrouter_api_key = _required("OPENROUTER_API_KEY")
+    openrouter_model_key = os.getenv("OPENROUTER_MODEL_KEY", "gemini-flash").strip()
+
+    if openrouter_model_key not in MODEL_ALLOWLIST:
+        allowed = ", ".join(sorted(MODEL_ALLOWLIST))
+        raise ValueError(
+            f"OPENROUTER_MODEL_KEY must be one of: {allowed}. "
+            f"Got: {openrouter_model_key!r}"
+        )
+
+    openrouter_site_url = os.getenv("OPENROUTER_SITE_URL", "").strip() or None
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip() or None
+
+    return Settings(
+        discord_bot_token=discord_bot_token,
+        discord_guild_id=discord_guild_id,
+        discord_channel_id=discord_channel_id,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_model_key=openrouter_model_key,
+        openrouter_app_name=os.getenv("OPENROUTER_APP_NAME", "LeetCode Assistant Bot").strip(),
+        openrouter_site_url=openrouter_site_url,
+        deepseek_api_key=deepseek_api_key,
+        deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip(),
+    )
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _required_int(name: str) -> int:
+    value = _required(name)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer") from exc
+
+
+def _optional_int(name: str) -> int | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer") from exc
+</file>
+
+<file path="src/main.py">
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import discord
+from discord import app_commands
+
+from .config import load_settings
+from .purposes.formatter.commands import register_commands as register_formatter_commands
+from .purposes.leetcode.commands import answer_mention as answer_leetcode_mention
+from .purposes.leetcode.commands import register_commands as register_leetcode_commands
+from .purposes.leetcode.leetcode_client import LeetCodeClient
+from .purposes.remind.commands import register_commands as register_remind_commands
+from .purposes.remind.scheduler import ReminderScheduler
+from .purposes.remind.store import ReminderStore
+from .purposes.timer.commands import register_commands as register_timer_commands
+from .services.ai_client import AIClient
+from .services.context import collect_recent_context
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+LOGGER = logging.getLogger(__name__)
+
+settings = load_settings()
+intents = discord.Intents.default()
+intents.message_content = True
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+ai_client = AIClient(settings)
+leetcode_client = LeetCodeClient()
+reminder_store = ReminderStore()
+reminder_scheduler = ReminderScheduler(bot, reminder_store)
+register_leetcode_commands(tree, settings, ai_client, leetcode_client)
+register_timer_commands(tree, settings)
+register_formatter_commands(tree, settings, ai_client)
+register_remind_commands(tree, settings, leetcode_client, reminder_scheduler)
+
+
+@bot.event
+async def on_ready() -> None:
+    guild = discord.Object(id=settings.discord_guild_id)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+    await reminder_scheduler.start()
+    LOGGER.info("Logged in as %s. Slash commands synced to guild %s.", bot.user, settings.discord_guild_id)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+
+    if message.guild is None or message.guild.id != settings.discord_guild_id:
+        return
+
+    text = _strip_bot_mentions(message.content, bot.user.id).strip() if bot.user else message.content.strip()
+    if not text:
+        return
+
+    context = await collect_recent_context(message.channel, before=message, limit=12)
+    await answer_leetcode_mention(message, ai_client, text, context=context)
+
+
+def main() -> None:
+    _start_health_server()
+    try:
+        bot.run(settings.discord_bot_token)
+    finally:
+        asyncio.run(_close_clients())
+
+
+async def _close_clients() -> None:
+    await ai_client.close()
+    await leetcode_client.close()
+
+
+def _strip_bot_mentions(content: str, bot_user_id: int) -> str:
+    mention_forms = (f"<@{bot_user_id}>", f"<@!{bot_user_id}>")
+    for mention in mention_forms:
+        content = content.replace(mention, "")
+    return content
+
+
+def _start_health_server() -> None:
+    port = int(os.getenv("PORT", "8000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    LOGGER.info("Health server listening on port %s.", port)
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path not in ("/", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        LOGGER.debug("health check: " + format, *args)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path=".env.example">
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+DISCORD_CHANNEL_ID=
+
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL_KEY=gemini-flash
+OPENROUTER_APP_NAME=LeetCode Assistant Bot
+OPENROUTER_SITE_URL=
+
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=deepseek-chat
+</file>
+
+<file path=".gitignore">
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+venv/
+data/
+</file>
+
+<file path="README.md">
+# Discord Multi-Purpose Bot
+
+A private Discord bot currently focused on LeetCode assistance. It uses OpenRouter by default with a small allowlist of popular models and falls back to the DeepSeek API when configured.
+
+The project is structured as a multi-purpose Discord bot. The LeetCode Assistant is isolated under `src/purposes/leetcode/` so new bot purposes can be added without mixing feature code.
+
+## Features
+
+- Normal messages become a LeetCode Assistant session anywhere in the configured server
+- Recent channel/thread context for normal messages
+- `/models` command to show allowed model keys
+- OpenRouter primary provider
+- DeepSeek direct API fallback
+- Fixed Discord guild restriction; normal messages and utility commands work in any server channel or thread the bot can access
+- Assistant-style LeetCode prompt
+- Long Discord replies split into safe chunks
+
+## Project Structure
+
+```text
+src/
+  main.py                         # Discord startup, command sync, cleanup
+  config.py                       # Environment loading
+  purposes/
+    leetcode/
+      commands.py                 # /models, LeetCode message handling
+      leetcode_client.py          # LeetCode problem resolver
+      models.py                   # Model allowlist
+      tutor.py                    # Assistant prompt (chunking re-exported from services)
+  services/
+    ai_client.py                  # OpenRouter + DeepSeek fallback
+    context.py                    # Recent channel/thread context collection
+    discord_text.py               # Shared Discord message chunking
+    models.py                     # Shared model allowlist
+```
+
+When adding another purpose later, create another directory under `src/purposes/` and register its commands from `src/main.py`.
+
+## Setup
+
+Create a Discord application and bot at <https://discord.com/developers/applications>.
+
+Enable these bot permissions when inviting it:
+
+- `applications.commands`
+- `bot`
+- Send Messages
+- Send Messages in Threads
+- Create Public Threads
+- Use Slash Commands
+- Read Message History
+
+Enable **Message Content Intent** in the Discord Developer Portal under **Bot**. The LeetCode Assistant session uses normal channel/thread messages, so this intent is required.
+
+The bot uses recent messages from the current channel or thread as context, so messages like "explain this question" can refer to a nearby LeetCode reminder or previous conversation. It needs `Read Message History` and `Message Content Intent` for this to work well.
+
+Install dependencies:
+
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Create local config:
+
+```bash
+cp .env.example .env
+```
+
+Fill in `.env`:
+
+```env
+DISCORD_BOT_TOKEN=your_discord_bot_token
+DISCORD_GUILD_ID=your_server_id
+DISCORD_CHANNEL_ID=
+
+OPENROUTER_API_KEY=your_openrouter_key
+OPENROUTER_MODEL_KEY=gemini-flash
+OPENROUTER_APP_NAME=LeetCode Assistant Bot
+OPENROUTER_SITE_URL=
+
+DEEPSEEK_API_KEY=your_deepseek_key_optional_but_recommended
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+Run the bot:
+
+```bash
+python -m src.main
+```
+
+## Allowed OpenRouter Models
+
+Use these keys as `OPENROUTER_MODEL_KEY`:
+
+| Key | OpenRouter model |
+| --- | --- |
+| `deepseek-r1` | `deepseek/deepseek-r1` |
+| `deepseek-chat` | `deepseek/deepseek-chat-v3-0324` |
+| `gpt-4o-mini` | `openai/gpt-4o-mini` |
+| `gpt-4.1-mini` | `openai/gpt-4.1-mini` |
+| `claude-sonnet` | `anthropic/claude-3.5-sonnet` |
+| `gemini-flash` | `google/gemini-3.5-flash` |
+| `llama-405b` | `meta-llama/llama-3.1-405b-instruct` |
+
+Set the default model with:
+
+```env
+OPENROUTER_MODEL_KEY=gemini-flash
+```
+
+## Discord IDs
+
+Enable Developer Mode in Discord, then right-click your server to copy its ID. `DISCORD_CHANNEL_ID` is currently optional and not used for restriction; the bot is allowed across the configured server, including threads it can access.
+
+## Notes
+
+- `.env` is ignored by git and should contain your real tokens.
+- DeepSeek fallback only works if `DEEPSEEK_API_KEY` is set.
+- Slash commands are synced to the configured guild on startup.
+</file>
+
+<file path="requirements.txt">
+discord.py>=2.4.0
+httpx>=0.27.0
+python-dotenv>=1.0.1
+black>=24.0
+</file>
+
+</files>
